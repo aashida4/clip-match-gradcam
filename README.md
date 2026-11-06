@@ -160,6 +160,9 @@ bash scripts/run_demo.sh
 
 ## 既知の注意点
 
+- Windows でも動く想定（パスは pathlib，collate は pickle 可能なクラス）．`scripts/run_demo.sh` だけは bash 前提なので Git Bash / WSL で実行する
+- パネル内の日本語表示用に OS の日本語フォント（Noto Sans CJK / Yu Gothic / Hiragino など）を自動で探す．無ければ豆腐になる
+
 - ViT の最終ブロックは self-attention で全パッチが混ざるため，CNN の Grad-CAM ほど局所的でない場合がある．
   ノイズが気になる場合は `--layer -2` や `--method gradcam++` / `scorecam` を試す
 - CLIP に素の Grad-CAM をかけると局所化精度が落ちるという報告がある（gScoreCAM, ACCV 2022）

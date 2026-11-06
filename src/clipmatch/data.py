@@ -86,21 +86,28 @@ class PairDataset(Dataset):
         return img, p.text, p.label
 
 
-def make_collate(processor, max_length: int = 77):
-    """Build a collate_fn that runs the HF processor on a batch.
+class Collate:
+    """HF processor をバッチに適用する collate_fn．
+    クロージャではなくクラスにしてあるのは，Windows の DataLoader（spawn）で pickle できるようにするため．
     max_length: CLIP は 77，SigLIP は 64（model.info["text_max_length"] を渡す）．"""
 
-    def collate(batch):
+    def __init__(self, processor, max_length: int = 77):
+        self.processor = processor
+        self.max_length = max_length
+
+    def __call__(self, batch):
         images, texts, labels = zip(*batch)
-        enc = processor(
+        enc = self.processor(
             text=list(texts),
             images=list(images),
             return_tensors="pt",
             padding="max_length",
             truncation=True,
-            max_length=max_length,
+            max_length=self.max_length,
         )
         enc["labels"] = torch.tensor(labels, dtype=torch.long)
         return enc
 
-    return collate
+
+def make_collate(processor, max_length: int = 77) -> Collate:
+    return Collate(processor, max_length)

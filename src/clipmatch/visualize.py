@@ -199,6 +199,31 @@ def decide(scores: dict, zeroshot: bool, threshold: float | None) -> int:
     return int(scores["prob_match"] >= 0.5)
 
 
+_CJK_FONT_CANDIDATES = [
+    "Noto Sans CJK JP", "Noto Sans JP", "IPAexGothic", "IPAGothic", "TakaoGothic",  # Linux
+    "Yu Gothic", "Meiryo", "MS Gothic",                                              # Windows
+    "Hiragino Sans", "Hiragino Kaku Gothic ProN",                                    # macOS
+]
+
+
+def _setup_font():
+    """日本語テキストが豆腐にならないよう，OS にある日本語フォントを優先させる．見つからなければ既定のまま．"""
+    import matplotlib
+    from matplotlib import font_manager
+    available = sorted({f.name for f in font_manager.fontManager.ttflist})
+    for name in _CJK_FONT_CANDIDATES:
+        if name in available:
+            matplotlib.rcParams["font.family"] = [name, "DejaVu Sans"]
+            return name
+    # 完全一致が無ければ前方一致（例: "Noto Sans CJK JP Medium"）
+    for name in _CJK_FONT_CANDIDATES:
+        hit = next((a for a in available if a.startswith(name)), None)
+        if hit:
+            matplotlib.rcParams["font.family"] = [hit, "DejaVu Sans"]
+            return hit
+    return None
+
+
 def render_panel(image: Image.Image, cam: np.ndarray, caption: str, out_png: Path,
                  signed: bool, direction: str, vmax: float | None = None):
     """[original | overlay] + colorbar.
@@ -211,6 +236,7 @@ def render_panel(image: Image.Image, cam: np.ndarray, caption: str, out_png: Pat
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    _setup_font()
 
     size = cam.shape[0]
     rgb = np.asarray(image.resize((size, size)))
