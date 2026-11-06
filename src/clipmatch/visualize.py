@@ -46,7 +46,6 @@ from pytorch_grad_cam import (
     LayerCAM,
     ScoreCAM,
 )
-from pytorch_grad_cam.utils.image import show_cam_on_image
 
 from .model import ClipMatchClassifier, load_checkpoint, load_processor
 
@@ -123,6 +122,31 @@ def build_model(args, device):
     return model, model_name
 
 
+def signed_gradcam(wrapper, target_layer, pixel_values, grid: int, direction: str):
+    """Grad-CAM without the ReLU: weights = mean gradient per channel,
+    cam = Σ_c w_c · A_c, sign kept.  Returns (H_grid, W_grid) float array
+    where >0 = pushes the target up, <0 = pushes it down."""
+    store = {}
+
+    def fwd_hook(_m, _i, out):
+        out.retain_grad()
+        store["act"] = out
+
+    h = target_layer.register_forward_hook(fwd_hook)
+    try:
+        wrapper.zero_grad(set_to_none=True)
+        out = wrapper(pixel_values)
+        score = LogitDiffTarget(direction)(out).sum()
+        score.backward()
+    finally:
+        h.remove()
+    act = make_reshape_transform(grid)(store["act"]).detach()           # (B,C,H,W)
+    grad = make_reshape_transform(grid)(store["act"].grad).detach()     # (B,C,H,W)
+    weights = grad.mean(dim=(2, 3), keepdim=True)
+    cam = (weights * act).sum(dim=1)                                    # (B,H,W), no ReLU
+    return cam[0].float().cpu().numpy()
+
+
 # --------------------------------------------------------------------------- #
 def explain_one(
     model: ClipMatchClassifier,
@@ -133,9 +157,12 @@ def explain_one(
     method: str = "gradcam",
     layer: int = -1,
     direction: str = "match",
+    signed: bool = False,
 ):
-    """Returns (scores dict, cam[H,W] in [0,1], overlay RGB uint8).
+    """Returns (scores dict, cam[H,W]).
 
+    signed=False: pytorch-grad-cam の出力（ReLU 後，画像内 min-max で [0,1]）
+    signed=True : ReLU なしの生の加重和（符号あり，正規化なし）
     scores = {"cos": raw cosine similarity, "prob_match": softmax prob (学習済み head 経由)}
     """
     enc = processor(text=[text], images=image, return_tensors="pt", padding="max_length",
@@ -146,24 +173,24 @@ def explain_one(
 
     wrapper = ImageOnlyWrapper(model, input_ids, attention_mask)
     target_layer = model.clip.vision_model.encoder.layers[layer].layer_norm1
-    cam_cls = METHODS[method]
-    cam = cam_cls(
-        model=wrapper,
-        target_layers=[target_layer],
-        reshape_transform=make_reshape_transform(vit_grid_size(model)),
-    )
-    grayscale = cam(input_tensor=pixel_values, targets=[LogitDiffTarget(direction)])[0]
+    size = model.clip.config.vision_config.image_size
+    if signed:
+        cam_small = signed_gradcam(wrapper, target_layer, pixel_values, vit_grid_size(model), direction)
+        cam = cv2.resize(cam_small, (size, size), interpolation=cv2.INTER_LINEAR)
+    else:
+        cam_cls = METHODS[method]
+        cam_obj = cam_cls(
+            model=wrapper,
+            target_layers=[target_layer],
+            reshape_transform=make_reshape_transform(vit_grid_size(model)),
+        )
+        cam = cam_obj(input_tensor=pixel_values, targets=[LogitDiffTarget(direction)])[0]
 
     with torch.no_grad():
         cos = model.similarity(pixel_values, input_ids, attention_mask)[0].item()
         prob = F.softmax(wrapper(pixel_values), -1)[0, 1].item()
     scores = {"cos": cos, "prob_match": prob}
-
-    # overlay on the *original* image (resized to model input size for alignment)
-    size = model.clip.config.vision_config.image_size
-    rgb = np.asarray(image.resize((size, size))).astype(np.float32) / 255.0
-    overlay = show_cam_on_image(rgb, grayscale, use_rgb=True)
-    return scores, grayscale, overlay
+    return scores, cam
 
 
 def decide(scores: dict, zeroshot: bool, threshold: float) -> int:
@@ -173,25 +200,58 @@ def decide(scores: dict, zeroshot: bool, threshold: float) -> int:
     return int(scores["prob_match"] >= 0.5)
 
 
-def save_result(out_dir: Path, stem: str, image: Image.Image, overlay, cam, scores, pred,
-                text, label=None, zeroshot=False, threshold=None, direction="match"):
+def render_panel(image: Image.Image, cam: np.ndarray, caption: str, out_png: Path,
+                 signed: bool, direction: str):
+    """[original | overlay] + colorbar.
+
+    signed=False: jet, 0 (blue) = ReLU 後に寄与なし（負か無関係かは区別できない），
+                  1 (red) = この画像内での最大寄与．画像間の比較には使えない．
+    signed=True : 発散カラーマップ，白 = 0，赤 = target を押し上げる，青 = 押し下げる．
+                  スケールは ±max|cam| で対称．
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    size = cam.shape[0]
+    rgb = np.asarray(image.resize((size, size)))
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.6), constrained_layout=True)
+    axes[0].imshow(rgb)
+    axes[0].set_title("input")
+    axes[1].imshow(rgb)
+    if signed:
+        v = float(np.abs(cam).max()) or 1.0
+        im = axes[1].imshow(cam, cmap="RdBu_r", vmin=-v, vmax=v, alpha=0.55)
+        cb_label = f"signed Grad-CAM (red: +{direction}, blue: -{direction})"
+        axes[1].set_title("signed Grad-CAM (no ReLU)")
+    else:
+        im = axes[1].imshow(cam, cmap="jet", vmin=0, vmax=1, alpha=0.5)
+        cb_label = f"Grad-CAM [{direction}]  (ReLU, per-image min-max)"
+        axes[1].set_title("Grad-CAM")
+    for ax in axes:
+        ax.set_xticks([]); ax.set_yticks([])
+    cb = fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.02)
+    cb.set_label(cb_label, fontsize=8)
+    fig.suptitle(caption, fontsize=9)
+    fig.savefig(out_png, dpi=120)
+    plt.close(fig)
+
+
+def save_result(out_dir: Path, stem: str, image: Image.Image, cam, scores, pred,
+                text, label=None, zeroshot=False, threshold=None, direction="match",
+                signed=False):
     out_dir.mkdir(parents=True, exist_ok=True)
-    size = overlay.shape[0]
-    orig = np.asarray(image.resize((size, size)))
-    # [original | heatmap] side by side, with caption
-    panel = np.concatenate([orig, overlay], axis=1)
-    panel = cv2.copyMakeBorder(panel, 0, 40, 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255))
     if zeroshot:
         caption = f"cos={scores['cos']:.3f} (thr={threshold:.2f}) pred={pred}"
     else:
         caption = f"p(match)={scores['prob_match']:.3f} cos={scores['cos']:.3f} pred={pred}"
     if label is not None:
         caption += f" label={label}"
-    caption += f" [{direction}]"
-    cv2.putText(panel, caption, (8, size + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    Image.fromarray(panel).save(out_dir / f"{stem}.png")
+    caption += f"\n\"{text}\""
+    render_panel(image, cam, caption, out_dir / f"{stem}.png", signed, direction)
     np.save(out_dir / f"{stem}_cam.npy", cam)
-    meta = {"text": text, "label": label, "pred": pred, "direction": direction, **scores}
+    meta = {"text": text, "label": label, "pred": pred, "direction": direction,
+            "signed": signed, **scores}
     if zeroshot:
         meta["threshold"] = threshold
         meta.pop("prob_match")  # zeroshot では head 未学習なので意味を持たない
@@ -213,6 +273,8 @@ def parse_args():
     ap.add_argument("--layer", type=int, default=-1, help="vision encoder のブロック index")
     ap.add_argument("--direction", choices=["match", "mismatch"], default="match",
                     help="match=類似度を上げている領域, mismatch=下げている領域（負勾配）")
+    ap.add_argument("--signed", action="store_true",
+                    help="ReLU なしの符号付き Grad-CAM（赤=正，青=負，白=0）．--method は gradcam 固定")
     ap.add_argument("--threshold", type=float, default=0.25,
                     help="--zeroshot 時の一致判定の cos 閾値（表示用．ヒートマップには影響しない）")
     ap.add_argument("--limit", type=int, default=None, help="CSV の先頭 N 件だけ")
@@ -239,12 +301,12 @@ def main():
                 p = base / p
             label = int(r.label) if "label" in df.columns else None
             img = Image.open(p).convert("RGB")
-            scores, cam, overlay = explain_one(model, processor, img, str(r.text), device,
-                                               args.method, args.layer, args.direction)
+            scores, cam = explain_one(model, processor, img, str(r.text), device,
+                                      args.method, args.layer, args.direction, args.signed)
             pred = decide(scores, args.zeroshot, args.threshold)
             stem = f"{i:05d}_{p.stem}"
-            save_result(out_dir, stem, img, overlay, cam, scores, pred, str(r.text), label,
-                        args.zeroshot, args.threshold, args.direction)
+            save_result(out_dir, stem, img, cam, scores, pred, str(r.text), label,
+                        args.zeroshot, args.threshold, args.direction, args.signed)
             row = {"idx": i, "image_path": str(p), "text": r.text, "label": label,
                    "cos": scores["cos"], "pred": pred, "png": f"{stem}.png"}
             if not args.zeroshot:
@@ -260,12 +322,12 @@ def main():
         if not (args.image and args.text):
             raise SystemExit("--image と --text，または --csv を指定してください")
         img = Image.open(args.image).convert("RGB")
-        scores, cam, overlay = explain_one(model, processor, img, args.text, device,
-                                           args.method, args.layer, args.direction)
+        scores, cam = explain_one(model, processor, img, args.text, device,
+                                  args.method, args.layer, args.direction, args.signed)
         pred = decide(scores, args.zeroshot, args.threshold)
         stem = Path(args.image).stem
-        save_result(out_dir, stem, img, overlay, cam, scores, pred, args.text, None,
-                    args.zeroshot, args.threshold, args.direction)
+        save_result(out_dir, stem, img, cam, scores, pred, args.text, None,
+                    args.zeroshot, args.threshold, args.direction, args.signed)
         print(f"cos={scores['cos']:.3f} pred={pred}  ->  {out_dir / (stem + '.png')}")
 
 

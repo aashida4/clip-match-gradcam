@@ -74,10 +74,25 @@ uv run python -m clipmatch.visualize --ckpt checkpoints/run1/best.pt --csv data/
 
 出力: `<stem>.png`（左: 元画像，右: ヒートマップ重畳，下: スコアと判定），`<stem>_cam.npy`，`<stem>.json`，一括時は `summary.csv`．
 
-## ヒートマップの意味
+## ヒートマップの意味と凡例
 
+### 既定（ReLU あり，jet カラーマップ）
+
+- 赤 = その画像内で target への寄与が最大の場所，青 = ReLU 後に寄与 0 の場所
+- **青は「負に効いている」と「無関係」を区別できない**（Grad-CAM の定義で負は ReLU で切られる）
+- 画像ごとに min–max 正規化するので，色の濃さは画像間で比較できない
 - `--direction match`（既定）: **cos(画像, 文) を上げている領域**．「この文と結びついている場所」
-- `--direction mismatch`: cos を**下げている**領域（負の勾配）．「この文に反している場所」
+- `--direction mismatch`: cos を**下げている**領域（符号反転してから ReLU）．「この文に反している場所」
+
+### `--signed`（ReLU なし，発散カラーマップ）
+
+```bash
+uv run python -m clipmatch.visualize --zeroshot --signed --image img.jpg --text "..." --out outputs/
+```
+
+- 白 = 0，赤 = target を押し上げる，青 = 押し下げる．スケールは ±max|cam| で対称，カラーバー付き
+- 正負を 1 枚で見たいときはこちら．`--method` は gradcam 固定（加重和を自前で計算しているため）
+- `_cam.npy` には正規化前の生の値が入る
 
 CAM のターゲットは ±(logit[match] − logit[mismatch])．cosine head ではこれが ±(exp(s)·cos + b) に等しいので，
 zero-shot でも学習後でもヒートマップの意味は同じ（学習でスケール・バイアスが変わっても形は変わらない）．
@@ -90,6 +105,7 @@ zero-shot でも学習後でもヒートマップの意味は同じ（学習で�
 | `--method` | `gradcam`（既定） / `gradcam++` / `scorecam` / `eigencam` / `layercam` |
 | `--layer` | ターゲットとする vision encoder ブロック（既定 `-1` = 最終ブロック） |
 | `--direction` | `match`（既定）/ `mismatch`．上記参照 |
+| `--signed` | ReLU なしの符号付き Grad-CAM（赤=正，青=負，白=0） |
 | `--threshold` | `--zeroshot` 時の判定閾値（cos）．ヒートマップには影響しない |
 
 ## 設計メモ
