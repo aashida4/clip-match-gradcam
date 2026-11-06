@@ -10,3 +10,4 @@ data/images/
 *.pt
 *.pth
 .DS_Store
+uv.lock

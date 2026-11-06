@@ -20,16 +20,17 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 
-[tool.uv]
-# CUDA 版 torch を使う場合は下の index を有効化して cu121 などに変更する
-# [[tool.uv.index]]
-# name = "pytorch-cu121"
-# url = "https://download.pytorch.org/whl/cu121"
-# explicit = true
-#
-# [tool.uv.sources]
-# torch = { index = "pytorch-cu121" }
-# torchvision = { index = "pytorch-cu121" }
+# --- PyTorch の CUDA ビルドを使う設定（既定: cu128） ---
+# CPU だけで動かしたい場合はこのブロックを丸ごとコメントアウトして `uv sync` する．
+# 別の CUDA バージョンにしたい場合は cu128 を cu121 / cu124 などに置き換える．
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [build-system]
 requires = ["hatchling"]
