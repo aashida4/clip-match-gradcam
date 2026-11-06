@@ -94,6 +94,19 @@ uv run python -m clipmatch.visualize --zeroshot --signed --image img.jpg --text 
 - 正負を 1 枚で見たいときはこちら．`--method` は gradcam 固定（加重和を自前で計算しているため）
 - `_cam.npy` には正規化前の生の値が入る
 
+**複数画像を比較するとき**は既定の per-image スケールだと凡例がばらつくので，以下のどちらかで揃える：
+
+```bash
+# CSV 一括: バッチ内の max|cam| を共通スケールにする（summary.csv に cam_absmax 列も出る）
+uv run python -m clipmatch.visualize --zeroshot --signed --shared-scale --csv data/val.csv --out outputs/
+
+# 手で固定: 別実行の結果と比べるとき（値は上の cam_absmax を見て決める）
+uv run python -m clipmatch.visualize --zeroshot --signed --vmax 0.1 --image img.jpg --text "..." --out outputs/
+```
+
+同じモデル・同じ層・同じ `--direction` なら CAM の値は画像間で同じ単位なので，共通スケールでの比較に意味がある．
+モデルや層を変えた結果同士を同じスケールで比べることには意味がない．
+
 CAM のターゲットは ±(logit[match] − logit[mismatch])．cosine head ではこれが ±(exp(s)·cos + b) に等しいので，
 zero-shot でも学習後でもヒートマップの意味は同じ（学習でスケール・バイアスが変わっても形は変わらない）．
 `--head mlp` の場合だけ MLP 経由の勾配になる．
@@ -106,6 +119,8 @@ zero-shot でも学習後でもヒートマップの意味は同じ（学習で�
 | `--layer` | ターゲットとする vision encoder ブロック（既定 `-1` = 最終ブロック） |
 | `--direction` | `match`（既定）/ `mismatch`．上記参照 |
 | `--signed` | ReLU なしの符号付き Grad-CAM（赤=正，青=負，白=0） |
+| `--shared-scale` | `--signed --csv` でバッチ内共通の ±vmax を使う |
+| `--vmax` | `--signed` のカラースケールを ±vmax に固定 |
 | `--threshold` | `--zeroshot` 時の判定閾値（cos）．ヒートマップには影響しない |
 
 ## 設計メモ

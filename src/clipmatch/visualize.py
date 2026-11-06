@@ -201,7 +201,7 @@ def decide(scores: dict, zeroshot: bool, threshold: float) -> int:
 
 
 def render_panel(image: Image.Image, cam: np.ndarray, caption: str, out_png: Path,
-                 signed: bool, direction: str):
+                 signed: bool, direction: str, vmax: float | None = None):
     """[original | overlay] + colorbar.
 
     signed=False: jet, 0 (blue) = ReLU 後に寄与なし（負か無関係かは区別できない），
@@ -220,10 +220,11 @@ def render_panel(image: Image.Image, cam: np.ndarray, caption: str, out_png: Pat
     axes[0].set_title("input")
     axes[1].imshow(rgb)
     if signed:
-        v = float(np.abs(cam).max()) or 1.0
+        v = vmax if vmax is not None else (float(np.abs(cam).max()) or 1.0)
         im = axes[1].imshow(cam, cmap="RdBu_r", vmin=-v, vmax=v, alpha=0.55)
         cb_label = f"signed Grad-CAM (red: +{direction}, blue: -{direction})"
-        axes[1].set_title("signed Grad-CAM (no ReLU)")
+        scale_note = "fixed scale" if vmax is not None else "per-image scale"
+        axes[1].set_title(f"signed Grad-CAM (no ReLU, {scale_note})")
     else:
         im = axes[1].imshow(cam, cmap="jet", vmin=0, vmax=1, alpha=0.5)
         cb_label = f"Grad-CAM [{direction}]  (ReLU, per-image min-max)"
@@ -239,7 +240,7 @@ def render_panel(image: Image.Image, cam: np.ndarray, caption: str, out_png: Pat
 
 def save_result(out_dir: Path, stem: str, image: Image.Image, cam, scores, pred,
                 text, label=None, zeroshot=False, threshold=None, direction="match",
-                signed=False):
+                signed=False, vmax=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     if zeroshot:
         caption = f"cos={scores['cos']:.3f} (thr={threshold:.2f}) pred={pred}"
@@ -248,10 +249,10 @@ def save_result(out_dir: Path, stem: str, image: Image.Image, cam, scores, pred,
     if label is not None:
         caption += f" label={label}"
     caption += f"\n\"{text}\""
-    render_panel(image, cam, caption, out_dir / f"{stem}.png", signed, direction)
+    render_panel(image, cam, caption, out_dir / f"{stem}.png", signed, direction, vmax)
     np.save(out_dir / f"{stem}_cam.npy", cam)
     meta = {"text": text, "label": label, "pred": pred, "direction": direction,
-            "signed": signed, **scores}
+            "signed": signed, "vmax": vmax, **scores}
     if zeroshot:
         meta["threshold"] = threshold
         meta.pop("prob_match")  # zeroshot では head 未学習なので意味を持たない
@@ -275,6 +276,10 @@ def parse_args():
                     help="match=類似度を上げている領域, mismatch=下げている領域（負勾配）")
     ap.add_argument("--signed", action="store_true",
                     help="ReLU なしの符号付き Grad-CAM（赤=正，青=負，白=0）．--method は gradcam 固定")
+    ap.add_argument("--vmax", type=float, default=None,
+                    help="--signed のカラースケールを ±vmax に固定（別実行の結果と比べるとき用）")
+    ap.add_argument("--shared-scale", action="store_true",
+                    help="--signed + --csv で，バッチ内の max|cam| を共通の ±vmax にする")
     ap.add_argument("--threshold", type=float, default=0.25,
                     help="--zeroshot 時の一致判定の cos 閾値（表示用．ヒートマップには影響しない）")
     ap.add_argument("--limit", type=int, default=None, help="CSV の先頭 N 件だけ")
@@ -294,7 +299,8 @@ def main():
         if args.limit:
             df = df.head(args.limit)
         base = Path(args.csv).parent
-        rows = []
+        # pass 1: compute all CAMs
+        results = []
         for i, r in enumerate(df.itertuples(index=False)):
             p = Path(r.image_path)
             if not p.is_absolute():
@@ -303,16 +309,28 @@ def main():
             img = Image.open(p).convert("RGB")
             scores, cam = explain_one(model, processor, img, str(r.text), device,
                                       args.method, args.layer, args.direction, args.signed)
+            results.append((i, p, img, str(r.text), label, scores, cam))
+            print(f"[{i}] cos={scores['cos']:.3f} label={label} {p.name}")
+
+        vmax = args.vmax
+        if args.signed and args.shared_scale and vmax is None:
+            vmax = max(float(np.abs(c).max()) for *_, c in results) or 1.0
+            print(f"shared vmax = {vmax:.4f}")
+
+        # pass 2: render
+        rows = []
+        for i, p, img, text, label, scores, cam in results:
             pred = decide(scores, args.zeroshot, args.threshold)
             stem = f"{i:05d}_{p.stem}"
-            save_result(out_dir, stem, img, cam, scores, pred, str(r.text), label,
-                        args.zeroshot, args.threshold, args.direction, args.signed)
-            row = {"idx": i, "image_path": str(p), "text": r.text, "label": label,
+            save_result(out_dir, stem, img, cam, scores, pred, text, label,
+                        args.zeroshot, args.threshold, args.direction, args.signed, vmax)
+            row = {"idx": i, "image_path": str(p), "text": text, "label": label,
                    "cos": scores["cos"], "pred": pred, "png": f"{stem}.png"}
             if not args.zeroshot:
                 row["prob_match"] = scores["prob_match"]
+            if args.signed:
+                row["cam_absmax"] = float(np.abs(cam).max())
             rows.append(row)
-            print(f"[{i}] cos={scores['cos']:.3f} pred={pred} label={label} {p.name}")
         df_out = pd.DataFrame(rows)
         df_out.to_csv(out_dir / "summary.csv", index=False)
         if "label" in df.columns:
@@ -327,7 +345,7 @@ def main():
         pred = decide(scores, args.zeroshot, args.threshold)
         stem = Path(args.image).stem
         save_result(out_dir, stem, img, cam, scores, pred, args.text, None,
-                    args.zeroshot, args.threshold, args.direction, args.signed)
+                    args.zeroshot, args.threshold, args.direction, args.signed, args.vmax)
         print(f"cos={scores['cos']:.3f} pred={pred}  ->  {out_dir / (stem + '.png')}")
 
 
