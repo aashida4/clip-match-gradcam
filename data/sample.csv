@@ -1,0 +1,5 @@
+image_path,text,label
+images/001.jpg,"a cat sitting on a sofa",1
+images/001.jpg,"a dog running in a park",0
+images/002.jpg,"a student writing on a whiteboard",1
+images/002.jpg,"a bowl of ramen on a table",0
