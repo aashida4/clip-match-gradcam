@@ -7,11 +7,19 @@ Example:
     uv run python -m clipmatch.visualize --ckpt checkpoints/run1/best.pt \
         --image data/images/001.jpg --text "a cat sitting on a sofa" --out outputs/
 
-    # 学習なし（zero-shot）: CLIP の類似度そのものを可視化
-    uv run python -m clipmatch.visualize --zeroshot --image img.jpg --text "..." --out outputs/
+    # 学習なし（zero-shot）: CLIP の類似度そのものを可視化．判定は cos の閾値
+    uv run python -m clipmatch.visualize --zeroshot --threshold 0.25 \
+        --image img.jpg --text "..." --out outputs/
 
     # CSV をまとめて処理
     uv run python -m clipmatch.visualize --ckpt ... --csv data/val.csv --out outputs/
+
+ヒートマップの意味:
+    --direction match    : 類似度 cos(img, txt) を「上げている」領域（既定）
+    --direction mismatch : 類似度を「下げている」領域（負の勾配）
+    どちらも CAM のターゲットは ±(logit[match] - logit[mismatch])．
+    cosine head ではこれは ±(exp(s)·cos + b) なので，head の学習有無に関わらず
+    「この文と結びついている領域」を見ていることになる．
 
 手法: ``--method`` で gradcam / gradcam++ / scorecam / eigencam / layercam を選択．
 ターゲット層はデフォルトで vision encoder 最終ブロックの layer_norm1
@@ -39,9 +47,25 @@ from pytorch_grad_cam import (
     ScoreCAM,
 )
 from pytorch_grad_cam.utils.image import show_cam_on_image
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
 from .model import ClipMatchClassifier, load_checkpoint, load_processor
+
+
+class LogitDiffTarget:
+    """CAM target = logit[match] - logit[mismatch] (sign flipped for 'mismatch').
+
+    cosine head では mismatch 側の logit が定数 0 なので，これは
+    ±(exp(s)·cos + b) に等しく，「類似度を上げる／下げる領域」になる．
+    mlp head でも両クラスの差を取るので，head によらず同じ意味で使える．
+    """
+
+    def __init__(self, direction: str):
+        self.sign = 1.0 if direction == "match" else -1.0
+
+    def __call__(self, model_output):
+        if model_output.dim() == 1:
+            model_output = model_output[None]
+        return self.sign * (model_output[:, 1] - model_output[:, 0])
 
 METHODS = {
     "gradcam": GradCAM,
@@ -108,9 +132,12 @@ def explain_one(
     device,
     method: str = "gradcam",
     layer: int = -1,
-    target_class: int = 1,
+    direction: str = "match",
 ):
-    """Returns (prob_match, cam[H,W] in [0,1], overlay RGB uint8)."""
+    """Returns (scores dict, cam[H,W] in [0,1], overlay RGB uint8).
+
+    scores = {"cos": raw cosine similarity, "prob_match": softmax prob (学習済み head 経由)}
+    """
     enc = processor(text=[text], images=image, return_tensors="pt", padding="max_length",
                     truncation=True, max_length=77)
     pixel_values = enc["pixel_values"].to(device)
@@ -125,34 +152,50 @@ def explain_one(
         target_layers=[target_layer],
         reshape_transform=make_reshape_transform(vit_grid_size(model)),
     )
-    grayscale = cam(input_tensor=pixel_values, targets=[ClassifierOutputTarget(target_class)])[0]
+    grayscale = cam(input_tensor=pixel_values, targets=[LogitDiffTarget(direction)])[0]
 
     with torch.no_grad():
+        cos = model.similarity(pixel_values, input_ids, attention_mask)[0].item()
         prob = F.softmax(wrapper(pixel_values), -1)[0, 1].item()
+    scores = {"cos": cos, "prob_match": prob}
 
     # overlay on the *original* image (resized to model input size for alignment)
     size = model.clip.config.vision_config.image_size
     rgb = np.asarray(image.resize((size, size))).astype(np.float32) / 255.0
     overlay = show_cam_on_image(rgb, grayscale, use_rgb=True)
-    return prob, grayscale, overlay
+    return scores, grayscale, overlay
 
 
-def save_result(out_dir: Path, stem: str, image: Image.Image, overlay, cam, prob, text, label=None):
+def decide(scores: dict, zeroshot: bool, threshold: float) -> int:
+    """1 = match, 0 = mismatch.  zeroshot は cos の閾値，学習済みは p(match) >= 0.5．"""
+    if zeroshot:
+        return int(scores["cos"] >= threshold)
+    return int(scores["prob_match"] >= 0.5)
+
+
+def save_result(out_dir: Path, stem: str, image: Image.Image, overlay, cam, scores, pred,
+                text, label=None, zeroshot=False, threshold=None, direction="match"):
     out_dir.mkdir(parents=True, exist_ok=True)
     size = overlay.shape[0]
     orig = np.asarray(image.resize((size, size)))
     # [original | heatmap] side by side, with caption
     panel = np.concatenate([orig, overlay], axis=1)
     panel = cv2.copyMakeBorder(panel, 0, 40, 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-    caption = f"p(match)={prob:.3f}"
+    if zeroshot:
+        caption = f"cos={scores['cos']:.3f} (thr={threshold:.2f}) pred={pred}"
+    else:
+        caption = f"p(match)={scores['prob_match']:.3f} cos={scores['cos']:.3f} pred={pred}"
     if label is not None:
-        caption += f"  label={label}"
-    cv2.putText(panel, caption, (8, size + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+        caption += f" label={label}"
+    caption += f" [{direction}]"
+    cv2.putText(panel, caption, (8, size + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     Image.fromarray(panel).save(out_dir / f"{stem}.png")
     np.save(out_dir / f"{stem}_cam.npy", cam)
-    (out_dir / f"{stem}.json").write_text(
-        json.dumps({"text": text, "prob_match": prob, "label": label}, ensure_ascii=False, indent=2)
-    )
+    meta = {"text": text, "label": label, "pred": pred, "direction": direction, **scores}
+    if zeroshot:
+        meta["threshold"] = threshold
+        meta.pop("prob_match")  # zeroshot では head 未学習なので意味を持たない
+    (out_dir / f"{stem}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
 # --------------------------------------------------------------------------- #
@@ -168,8 +211,10 @@ def parse_args():
     ap.add_argument("--out", default="outputs")
     ap.add_argument("--method", choices=list(METHODS), default="gradcam")
     ap.add_argument("--layer", type=int, default=-1, help="vision encoder のブロック index")
-    ap.add_argument("--target", type=int, default=1, choices=[0, 1],
-                    help="1=match の根拠, 0=mismatch の根拠")
+    ap.add_argument("--direction", choices=["match", "mismatch"], default="match",
+                    help="match=類似度を上げている領域, mismatch=下げている領域（負勾配）")
+    ap.add_argument("--threshold", type=float, default=0.25,
+                    help="--zeroshot 時の一致判定の cos 閾値（表示用．ヒートマップには影響しない）")
     ap.add_argument("--limit", type=int, default=None, help="CSV の先頭 N 件だけ")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return ap.parse_args()
@@ -194,23 +239,34 @@ def main():
                 p = base / p
             label = int(r.label) if "label" in df.columns else None
             img = Image.open(p).convert("RGB")
-            prob, cam, overlay = explain_one(model, processor, img, str(r.text), device,
-                                             args.method, args.layer, args.target)
+            scores, cam, overlay = explain_one(model, processor, img, str(r.text), device,
+                                               args.method, args.layer, args.direction)
+            pred = decide(scores, args.zeroshot, args.threshold)
             stem = f"{i:05d}_{p.stem}"
-            save_result(out_dir, stem, img, overlay, cam, prob, str(r.text), label)
-            rows.append({"idx": i, "image_path": str(p), "text": r.text, "label": label,
-                         "prob_match": prob, "png": f"{stem}.png"})
-            print(f"[{i}] p(match)={prob:.3f} label={label} {p.name}")
-        pd.DataFrame(rows).to_csv(out_dir / "summary.csv", index=False)
+            save_result(out_dir, stem, img, overlay, cam, scores, pred, str(r.text), label,
+                        args.zeroshot, args.threshold, args.direction)
+            row = {"idx": i, "image_path": str(p), "text": r.text, "label": label,
+                   "cos": scores["cos"], "pred": pred, "png": f"{stem}.png"}
+            if not args.zeroshot:
+                row["prob_match"] = scores["prob_match"]
+            rows.append(row)
+            print(f"[{i}] cos={scores['cos']:.3f} pred={pred} label={label} {p.name}")
+        df_out = pd.DataFrame(rows)
+        df_out.to_csv(out_dir / "summary.csv", index=False)
+        if "label" in df.columns:
+            acc = (df_out["pred"] == df_out["label"]).mean()
+            print(f"accuracy={acc:.3f}  (n={len(df_out)})")
     else:
         if not (args.image and args.text):
             raise SystemExit("--image と --text，または --csv を指定してください")
         img = Image.open(args.image).convert("RGB")
-        prob, cam, overlay = explain_one(model, processor, img, args.text, device,
-                                         args.method, args.layer, args.target)
+        scores, cam, overlay = explain_one(model, processor, img, args.text, device,
+                                           args.method, args.layer, args.direction)
+        pred = decide(scores, args.zeroshot, args.threshold)
         stem = Path(args.image).stem
-        save_result(out_dir, stem, img, overlay, cam, prob, args.text)
-        print(f"p(match)={prob:.3f}  ->  {out_dir / (stem + '.png')}")
+        save_result(out_dir, stem, img, overlay, cam, scores, pred, args.text, None,
+                    args.zeroshot, args.threshold, args.direction)
+        print(f"cos={scores['cos']:.3f} pred={pred}  ->  {out_dir / (stem + '.png')}")
 
 
 if __name__ == "__main__":

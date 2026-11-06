@@ -26,10 +26,32 @@ images/001.jpg,"a dog running in a park",0
 - `label`: 1 = 一致，0 = 不一致
 - `label` 列が無い場合は全行を一致ペアとみなし，他行のテキストをランダムに組み合わせて不一致ペアを自動生成する（`--neg-ratio` で比率指定）
 
-## 学習
+## 基本的な使い方（学習なし）
+
+学習済み CLIP をそのまま使う．分類は「cos 類似度 ≥ 閾値」で行い，ヒートマップはその類似度に対する Grad-CAM．
 
 ```bash
-# head（類似度のスケール・バイアス）のみ学習．バックボーンは凍結
+# 1 件
+uv run python -m clipmatch.visualize --zeroshot --threshold 0.25 \
+    --image img.jpg --text "a cat sitting on a sofa" --out outputs/
+
+# CSV 一括（label 列があれば accuracy も表示）
+uv run python -m clipmatch.visualize --zeroshot --threshold 0.25 --csv data/val.csv --out outputs/zs
+```
+
+閾値は CLIP のモデルやドメインで変わる（ViT-B/32 では 0.2〜0.3 あたりが目安）．
+手持ちのラベル付きペアで `summary.csv` の `cos` 列を見て決めるか，下の train.py で自動的に決める．
+
+## 閾値のキャリブレーション／微調整（train.py）
+
+train.py は必須ではない．用途は 2 つ：
+
+1. **閾値キャリブレーション**（既定）: `cosine` head の scale と bias（2 パラメータ）だけをラベル付きペアで学習する．
+   CLIP 本体は凍結．数十〜数百ペアで足りる．これで `p(match)` が校正された確率になる
+2. **本当の微調整**: `--unfreeze-last N` や `--head mlp` を使う．CLIP の表現がドメインに合っていない場合のみ
+
+```bash
+# 閾値キャリブレーションのみ（CLIP は凍結，学習パラメータは 2 個）
 uv run python -m clipmatch.train --csv data/train.csv --out checkpoints/run1
 
 # vision tower の末尾 2 ブロックも微調整
@@ -42,21 +64,24 @@ uv run python -m clipmatch.train --csv data/train.csv --head mlp
 
 `--val-csv` を省略すると 8:2 に stratified split する．`best.pt`（val AUC 最良）と `last.pt` を保存．
 
-## 可視化
+## 学習済みチェックポイントでの可視化
 
 ```bash
-# 1 件
 uv run python -m clipmatch.visualize --ckpt checkpoints/run1/best.pt \
     --image path/to/img.jpg --text "a cat sitting on a sofa" --out outputs/
-
-# CSV 一括（summary.csv も出力）
 uv run python -m clipmatch.visualize --ckpt checkpoints/run1/best.pt --csv data/val.csv --out outputs/val
-
-# 学習せずに CLIP の類似度をそのまま可視化
-uv run python -m clipmatch.visualize --zeroshot --image img.jpg --text "..." --out outputs/
 ```
 
-出力: `<stem>.png`（左: 元画像，右: ヒートマップ重畳，下: p(match)），`<stem>_cam.npy`，`<stem>.json`．
+出力: `<stem>.png`（左: 元画像，右: ヒートマップ重畳，下: スコアと判定），`<stem>_cam.npy`，`<stem>.json`，一括時は `summary.csv`．
+
+## ヒートマップの意味
+
+- `--direction match`（既定）: **cos(画像, 文) を上げている領域**．「この文と結びついている場所」
+- `--direction mismatch`: cos を**下げている**領域（負の勾配）．「この文に反している場所」
+
+CAM のターゲットは ±(logit[match] − logit[mismatch])．cosine head ではこれが ±(exp(s)·cos + b) に等しいので，
+zero-shot でも学習後でもヒートマップの意味は同じ（学習でスケール・バイアスが変わっても形は変わらない）．
+`--head mlp` の場合だけ MLP 経由の勾配になる．
 
 オプション:
 
@@ -64,7 +89,8 @@ uv run python -m clipmatch.visualize --zeroshot --image img.jpg --text "..." --o
 |---|---|
 | `--method` | `gradcam`（既定） / `gradcam++` / `scorecam` / `eigencam` / `layercam` |
 | `--layer` | ターゲットとする vision encoder ブロック（既定 `-1` = 最終ブロック） |
-| `--target` | `1` = 「一致」と判定した根拠（既定），`0` = 「不一致」の根拠 |
+| `--direction` | `match`（既定）/ `mismatch`．上記参照 |
+| `--threshold` | `--zeroshot` 時の判定閾値（cos）．ヒートマップには影響しない |
 
 ## 設計メモ
 
@@ -83,3 +109,9 @@ bash scripts/run_demo.sh
 ```
 
 `data/images/` に `001.jpg`, `002.jpg` を置いてから実行．
+
+## 既知の注意点
+
+- ViT の最終ブロックは self-attention で全パッチが混ざるため，CNN の Grad-CAM ほど局所的でない場合がある．
+  ノイズが気になる場合は `--layer -2` や `--method gradcam++` / `scorecam` を試す
+- CLIP に素の Grad-CAM をかけると局所化精度が落ちるという報告がある（gScoreCAM, ACCV 2022）

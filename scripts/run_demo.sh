@@ -12,4 +12,4 @@ uv run python -m clipmatch.train --csv data/sample.csv --out checkpoints/demo --
 uv run python -m clipmatch.visualize --ckpt checkpoints/demo/best.pt --csv data/sample.csv --out outputs/demo
 
 # 3) 可視化（zero-shot，学習不要）
-uv run python -m clipmatch.visualize --zeroshot --csv data/sample.csv --out outputs/zeroshot
+uv run python -m clipmatch.visualize --zeroshot --threshold 0.25 --csv data/sample.csv --out outputs/zeroshot

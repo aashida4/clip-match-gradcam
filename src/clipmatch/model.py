@@ -67,6 +67,11 @@ class ClipMatchClassifier(nn.Module):
         txt = F.normalize(txt, dim=-1)
         return img, txt
 
+    def similarity(self, pixel_values, input_ids, attention_mask):
+        """Raw cosine similarity between image and text embeddings (B,)."""
+        img, txt = self.encode(pixel_values, input_ids, attention_mask)
+        return (img * txt).sum(-1)
+
     def forward(self, pixel_values, input_ids, attention_mask, **_):
         img, txt = self.encode(pixel_values, input_ids, attention_mask)
         if self.head_type == "cosine":
