@@ -84,8 +84,9 @@ def main():
         )
     print(f"train={len(train_pairs)}  val={len(val_pairs)}")
 
+    model = ClipMatchClassifier(args.model, head=args.head, freeze_backbone=True)
     processor = load_processor(args.model)
-    collate = make_collate(processor)
+    collate = make_collate(processor, max_length=model.info["text_max_length"])
     train_loader = DataLoader(
         PairDataset(train_pairs), batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, collate_fn=collate,
@@ -95,7 +96,6 @@ def main():
         num_workers=args.num_workers, collate_fn=collate,
     )
 
-    model = ClipMatchClassifier(args.model, head=args.head, freeze_backbone=True)
     if args.unfreeze_last > 0:
         model.unfreeze_vision_last_n(args.unfreeze_last)
     model.to(args.device)

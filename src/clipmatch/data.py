@@ -87,7 +87,8 @@ class PairDataset(Dataset):
 
 
 def make_collate(processor, max_length: int = 77):
-    """Build a collate_fn that runs the HF CLIPProcessor on a batch."""
+    """Build a collate_fn that runs the HF processor on a batch.
+    max_length: CLIP は 77，SigLIP は 64（model.info["text_max_length"] を渡す）．"""
 
     def collate(batch):
         images, texts, labels = zip(*batch)

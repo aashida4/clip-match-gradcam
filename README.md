@@ -12,6 +12,23 @@ uv sync
 CUDA 版 PyTorch を使う場合は `pyproject.toml` の `[tool.uv]` 以下のコメントを外して
 index を `cu121` / `cu124` 等に合わせてから `uv sync` する．
 
+## 使えるバックボーン
+
+`--model` に Hugging Face の checkpoint 名を渡す（train.py / visualize.py 共通，学習済み ckpt にはモデル名が保存される）．
+
+| 系統 | 例 | グリッド | 備考 |
+|---|---|---|---|
+| CLIP | `openai/clip-vit-base-patch32`（既定） | 7×7 | 軽い．まず動かす用 |
+| CLIP | `openai/clip-vit-base-patch16` | 14×14 | |
+| CLIP | `openai/clip-vit-large-patch14-336` | 24×24 | OpenAI の最大 |
+| SigLIP 2 | `google/siglip2-base-patch16-224` | 14×14 | |
+| SigLIP 2 | `google/siglip2-so400m-patch14-384` | 27×27 | 約 1B パラメータ |
+
+- SigLIP / SigLIP 2 は **FixRes 版のみ対応**．`-naflex` 付きの checkpoint（可変パッチ）はエラーになる
+- SigLIP 系は sigmoid 損失で学習されており `logit_bias` を持つので，**zero-shot でも p(match) = sigmoid(scale·cos + bias) が校正済みの確率**として読める．
+  そのため `--zeroshot` 時の判定は CLIP 系が `cos >= --threshold`（既定 0.25），SigLIP 系が `p(match) >= 0.5`（`--threshold` を明示すれば cos 閾値に切替）
+- LAION / DFN など CLIP アーキテクチャで配布されている OpenCLIP 系も同じ経路で読めるはずだが，このコードでの動作は未確認
+
 ## データ形式
 
 `data/sample.csv` 参照．
@@ -128,10 +145,10 @@ zero-shot でも学習後でもヒートマップの意味は同じ（学習で�
 - **head = cosine**（既定）: `logit = exp(s)·cos(img, txt) + b`．Grad-CAM のターゲットが
   実質「画像–テキスト類似度」になるので，ヒートマップは「この文に対応する領域」として素直に読める．
 - **head = mlp**: `[img, txt, img⊙txt, |img−txt|]` → MLP．表現力は高いが，ヒートマップは MLP 経由の勾配になる．
-- ターゲット層は `vision_model.encoder.layers[-1].layer_norm1`，reshape は CLS を除いて
-  `(B, 1+N, C) → (B, C, √N, √N)`（pytorch-grad-cam の ViT 向け標準手順）．
-- ViT-B/32 では 7×7 グリッドなので粗い．細かく見たい場合は `--model openai/clip-vit-base-patch16`（14×14）
-  や `clip-vit-large-patch14`（16×16）を使う．
+- ターゲット層は `vision_model.encoder.layers[-1].layer_norm1`，reshape は
+  `(B, [1+]N, C) → (B, C, √N, √N)`（pytorch-grad-cam の ViT 向け標準手順）．CLIP は先頭の CLS を捨て，
+  SigLIP は CLS が無い（attention pooling）のでそのまま reshape する．
+- ViT-B/32 では 7×7 グリッドなので粗い．細かく見たい場合は上の表のモデルに替える．
 
 ## 最小動作確認
 

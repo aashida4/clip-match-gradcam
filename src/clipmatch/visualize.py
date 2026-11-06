@@ -95,20 +95,16 @@ class ImageOnlyWrapper(nn.Module):
         )
 
 
-def make_reshape_transform(grid: int):
-    """ViT の (B, 1+N, C) トークン列を (B, C, H, W) に戻す．CLS は捨てる．"""
+def make_reshape_transform(grid: int, has_cls: bool = True):
+    """ViT のトークン列 (B, [1+]N, C) を (B, C, H, W) に戻す．
+    CLIP は先頭の CLS を捨てる．SigLIP は CLS が無い（attention pooling）のでそのまま．"""
 
     def _reshape(tensor):
-        x = tensor[:, 1:, :]  # drop CLS
+        x = tensor[:, 1:, :] if has_cls else tensor
         x = x.reshape(x.size(0), grid, grid, x.size(2))
         return x.permute(0, 3, 1, 2)
 
     return _reshape
-
-
-def vit_grid_size(model: ClipMatchClassifier) -> int:
-    cfg = model.clip.config.vision_config
-    return cfg.image_size // cfg.patch_size
 
 
 def build_model(args, device):
@@ -122,7 +118,7 @@ def build_model(args, device):
     return model, model_name
 
 
-def signed_gradcam(wrapper, target_layer, pixel_values, grid: int, direction: str):
+def signed_gradcam(wrapper, target_layer, pixel_values, grid: int, has_cls: bool, direction: str):
     """Grad-CAM without the ReLU: weights = mean gradient per channel,
     cam = Σ_c w_c · A_c, sign kept.  Returns (H_grid, W_grid) float array
     where >0 = pushes the target up, <0 = pushes it down."""
@@ -140,8 +136,9 @@ def signed_gradcam(wrapper, target_layer, pixel_values, grid: int, direction: st
         score.backward()
     finally:
         h.remove()
-    act = make_reshape_transform(grid)(store["act"]).detach()           # (B,C,H,W)
-    grad = make_reshape_transform(grid)(store["act"].grad).detach()     # (B,C,H,W)
+    rt = make_reshape_transform(grid, has_cls)
+    act = rt(store["act"]).detach()           # (B,C,H,W)
+    grad = rt(store["act"].grad).detach()     # (B,C,H,W)
     weights = grad.mean(dim=(2, 3), keepdim=True)
     cam = (weights * act).sum(dim=1)                                    # (B,H,W), no ReLU
     return cam[0].float().cpu().numpy()
@@ -166,23 +163,23 @@ def explain_one(
     scores = {"cos": raw cosine similarity, "prob_match": softmax prob (学習済み head 経由)}
     """
     enc = processor(text=[text], images=image, return_tensors="pt", padding="max_length",
-                    truncation=True, max_length=77)
+                    truncation=True, max_length=model.info["text_max_length"])
     pixel_values = enc["pixel_values"].to(device)
     input_ids = enc["input_ids"].to(device)
     attention_mask = enc["attention_mask"].to(device)
 
     wrapper = ImageOnlyWrapper(model, input_ids, attention_mask)
     target_layer = model.clip.vision_model.encoder.layers[layer].layer_norm1
-    size = model.clip.config.vision_config.image_size
+    size, grid, has_cls = model.info["image_size"], model.info["grid"], model.info["has_cls"]
     if signed:
-        cam_small = signed_gradcam(wrapper, target_layer, pixel_values, vit_grid_size(model), direction)
+        cam_small = signed_gradcam(wrapper, target_layer, pixel_values, grid, has_cls, direction)
         cam = cv2.resize(cam_small, (size, size), interpolation=cv2.INTER_LINEAR)
     else:
         cam_cls = METHODS[method]
         cam_obj = cam_cls(
             model=wrapper,
             target_layers=[target_layer],
-            reshape_transform=make_reshape_transform(vit_grid_size(model)),
+            reshape_transform=make_reshape_transform(grid, has_cls),
         )
         cam = cam_obj(input_tensor=pixel_values, targets=[LogitDiffTarget(direction)])[0]
 
@@ -193,9 +190,11 @@ def explain_one(
     return scores, cam
 
 
-def decide(scores: dict, zeroshot: bool, threshold: float) -> int:
-    """1 = match, 0 = mismatch.  zeroshot は cos の閾値，学習済みは p(match) >= 0.5．"""
-    if zeroshot:
+def decide(scores: dict, zeroshot: bool, threshold: float | None) -> int:
+    """1 = match, 0 = mismatch.
+    zeroshot かつ threshold 指定あり → cos >= threshold．
+    それ以外（学習済み，または SigLIP 系の校正済み zero-shot）→ p(match) >= 0.5．"""
+    if zeroshot and threshold is not None:
         return int(scores["cos"] >= threshold)
     return int(scores["prob_match"] >= 0.5)
 
@@ -242,7 +241,7 @@ def save_result(out_dir: Path, stem: str, image: Image.Image, cam, scores, pred,
                 text, label=None, zeroshot=False, threshold=None, direction="match",
                 signed=False, vmax=None):
     out_dir.mkdir(parents=True, exist_ok=True)
-    if zeroshot:
+    if zeroshot and threshold is not None:
         caption = f"cos={scores['cos']:.3f} (thr={threshold:.2f}) pred={pred}"
     else:
         caption = f"p(match)={scores['prob_match']:.3f} cos={scores['cos']:.3f} pred={pred}"
@@ -253,9 +252,9 @@ def save_result(out_dir: Path, stem: str, image: Image.Image, cam, scores, pred,
     np.save(out_dir / f"{stem}_cam.npy", cam)
     meta = {"text": text, "label": label, "pred": pred, "direction": direction,
             "signed": signed, "vmax": vmax, **scores}
-    if zeroshot:
+    if zeroshot and threshold is not None:
         meta["threshold"] = threshold
-        meta.pop("prob_match")  # zeroshot では head 未学習なので意味を持たない
+        meta.pop("prob_match")  # CLIP の zero-shot では bias 未校正なので意味を持たない
     (out_dir / f"{stem}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
@@ -280,8 +279,9 @@ def parse_args():
                     help="--signed のカラースケールを ±vmax に固定（別実行の結果と比べるとき用）")
     ap.add_argument("--shared-scale", action="store_true",
                     help="--signed + --csv で，バッチ内の max|cam| を共通の ±vmax にする")
-    ap.add_argument("--threshold", type=float, default=0.25,
-                    help="--zeroshot 時の一致判定の cos 閾値（表示用．ヒートマップには影響しない）")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="--zeroshot 時の一致判定の cos 閾値（ヒートマップには影響しない）．"
+                         "未指定なら CLIP 系は 0.25，SigLIP 系は校正済みの p(match)>=0.5 を使う")
     ap.add_argument("--limit", type=int, default=None, help="CSV の先頭 N 件だけ")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return ap.parse_args()
@@ -293,6 +293,10 @@ def main():
     model, model_name = build_model(args, device)
     processor = load_processor(model_name)
     out_dir = Path(args.out)
+    if args.zeroshot and args.threshold is None and not model.calibrated:
+        args.threshold = 0.25
+    print(f"backbone={model.info['model_type']} grid={model.info['grid']}x{model.info['grid']} "
+          f"decision={'cos>=%.2f' % args.threshold if args.threshold is not None else 'p(match)>=0.5'}")
 
     if args.csv:
         df = pd.read_csv(args.csv)
@@ -326,7 +330,7 @@ def main():
                         args.zeroshot, args.threshold, args.direction, args.signed, vmax)
             row = {"idx": i, "image_path": str(p), "text": text, "label": label,
                    "cos": scores["cos"], "pred": pred, "png": f"{stem}.png"}
-            if not args.zeroshot:
+            if not args.zeroshot or args.threshold is None:
                 row["prob_match"] = scores["prob_match"]
             if args.signed:
                 row["cam_absmax"] = float(np.abs(cam).max())
